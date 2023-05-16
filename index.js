@@ -1,4 +1,5 @@
 const express = require('express');
+const tmi = require('tmi.js');
 const axios = require('axios');
 var { google } = require('googleapis');
 const bodyParser = require('body-parser');
@@ -10,6 +11,8 @@ const PORT = process.env.PORT || 8087;
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
+let didPoiAuthUs = false; // Did person of interest (the streamer) authorize us?
+let canSendMessage = true; // The switch that gets flicked for a certain period of time after someone uses a command to prevent bot spamming messages
 let ytSearchesLeft = 100;
 /* "Projects that enable the YouTube Data API have a default quota allocation of 10,000 units per day"
   "A search request costs 100 units."
@@ -229,7 +232,7 @@ const getTokens = (code, nodeRes) => {
     });
 };
 
-// A function for JSON response
+// A function for JSON response (No Twitch messages)
 const getCurrentSongJson = (nodeRes) => {
   emote = randomEmote();
 
@@ -352,6 +355,131 @@ const getCurrentSongJson = (nodeRes) => {
     });
 };
 
+// A function to fetch the current song being played
+const getCurrentSong = (target, displayName) => {
+  emote = randomEmote();
+
+  // Putting the !song command on a cooldown
+  canSendMessage = false;
+
+  // Fetch the current song
+  axios({
+    method: 'get',
+    headers: {
+      Authorization: `Authorization: Bearer ${accessToken}`,
+    },
+    url: 'https://api.spotify.com/v1/me/player/currently-playing',
+  })
+    .then((res) => {
+      if (res?.status === 204 && res?.statusText === 'No Content') {
+        // Streamer's Spotify is not playing any songs
+        client.say(
+          target,
+          `@${displayName} Streamer is currently not playing any music on Spotify.`
+        );
+      } else {
+        // There is music playing on the streamer's Spotify
+        if (currentSong?.title === res?.data?.item?.name) {
+          // Not the first person asking about this song (in this playthrough of the song at least)
+          emote = randomEmote();
+          if (currentSong?.youtubeId === 'notfound') {
+            // We haven't found anything on TY for this song
+            console.log('Another !song check for this song but no yt link');
+            client.say(
+              target,
+              `@${displayName} ${emote} "${currentSong.title}" by "${currentSong.artist}" ${emote}`
+            );
+          } else {
+            console.log(
+              'Another !song check with yt link from the previous query'
+            );
+            client.say(
+              target,
+              `@${displayName} ${emote} "${currentSong.title}" by "${currentSong.artist}" - https://youtu.be/${currentSong.youtubeId} ${emote}`
+            );
+          }
+        } else {
+          // This is the first query for this song, set the artist and title and search TY for a video of the song
+          let artistString = buildArtistString(res?.data?.item?.artists);
+          currentSong.title = res?.data?.item?.name;
+          currentSong.artist = artistString;
+          getYoutubeId(
+            target,
+            displayName,
+            res?.data?.item?.name,
+            artistString
+          );
+        }
+      }
+    })
+    .catch((err) => {
+      if (err?.response?.data?.error?.status === 401) {
+        // If there is an error with this call we have to check for 401 since access token expires every hour
+
+        // Since access token has expired we have to refresh it and call the getCurrentSong again
+        axios({
+          method: 'post',
+          headers: {
+            Authorization:
+              'Basic ' +
+              new Buffer.from(clientId + ':' + clientSecret).toString('base64'),
+            'content-type': 'application/x-www-form-urlencoded',
+          },
+          url: 'https://accounts.spotify.com/api/token',
+          data: {
+            grant_type: 'refresh_token',
+            refresh_token: refreshToken,
+          },
+        })
+          .then((res) => {
+            console.log(
+              'access token successfully refreshed. New access token: ',
+              res?.data?.access_token
+            );
+
+            // New access token that we got from the refresh has to be set in the app and in the db
+            accessToken = res?.data?.access_token;
+
+            pool
+              .query(
+                `UPDATE users SET access_token = '${res?.data?.access_token}' WHERE username = '${poi}';`
+              )
+              .then((res) => {
+                console.log(
+                  `successfuly updated the new access_token in the db after expiry for ${poi} `
+                );
+              })
+              .catch((err) => {
+                console.log(
+                  `updating the expired access_token in the db failed for ${poi}:  `,
+                  err
+                );
+              });
+
+            // Calling the getCurrentSong again with the new token
+            getCurrentSong(target, displayName);
+          })
+          .catch((err) => {
+            console.log(
+              'Refreshing the token failed: ',
+              err?.response?.data?.error
+            );
+          });
+      } else {
+        // Fetching current song failed and it wasn't because the access token expired
+        console.log(
+          'A different error in the getCurrentSong (not 401 when expired): ',
+          err?.response?.data?.error
+        );
+      }
+    });
+
+  // Reset the cooldown after a delay so the command can be used again
+  setTimeout(() => {
+    canSendMessage = true;
+  }, 10000);
+};
+
 // A function that returns the artist string (for handling the case where there is no artist listed or when there is more than one artist)
 const buildArtistString = (artistsArray) => {
   if (artistsArray?.length === 1) {
@@ -441,6 +569,64 @@ const getYoutubeIdJson = (title, artist, nodeRes) => {
     });
 };
 
+// A function that uses Google API to search YT for current song's video
+const getYoutubeId = (target, displayName, title, artist) => {
+  emote = randomEmote();
+  // Decrese the remaining YT search quota
+  ytSearchesLeft = ytSearchesLeft - 1;
+  console.log(
+    `Searching Youtube for "${title}" by "${artist}". We have ${ytSearchesLeft} searches left today.`
+  );
+
+  var service = google.youtube('v3');
+  let ytSearchQuery = `${title} ${artist}`;
+  service.search
+    .list({
+      part: 'snippet',
+      q: ytSearchQuery,
+      maxResults: 1,
+      regionCode: 'DE',
+      type: 'video',
+      key: process.env.GOOGLE_KEY,
+    })
+    .then((res) => {
+      if (res?.data?.items?.length > 0) {
+        // We have found something on YT for this artist + title query so we will provide a YT link for this song to the user
+        let videoId = res?.data?.items?.[0]?.id?.videoId;
+        console.log(
+          `A relevant Youtube video with an ID ${videoId} was found.`
+        );
+        currentSong.youtubeId = videoId;
+        client.say(
+          target,
+          `@${displayName} ${emote} "${title}" by "${artist}" - https://youtu.be/${currentSong.youtubeId} ${emote}`
+        );
+      } else {
+        // We haven't found anything so we will only provide the user with the songtitle and the artist
+        console.log(
+          'Youtube seach returned nothing. We will not provide a Youtube link to the user.'
+        );
+        currentSong.youtubeId = 'notfound';
+        client.say(
+          target,
+          `@${displayName} ${emote} "${title}" by "${artist}" ${emote}`
+        );
+      }
+    })
+    .catch((err) => {
+      // An error occured while searching YT so just provide the user with the song title and the artist
+      console.log(err);
+      console.log(
+        'Youtube seach returned an error. We will not provide a Youtube link to the user.'
+      );
+      currentSong.youtubeId = 'notfound';
+      client.say(
+        target,
+        `@${displayName} ${emote} "${currentSong.title}" by "${currentSong.artist}" ${emote}`
+      );
+    });
+};
+
 // Listen on /music for authorization attempts (/music is our redirect url in the Spotify app)
 app.get('/music', function (req, res) {
   let code = req?.query?.code;
@@ -453,3 +639,40 @@ app.get('/music', function (req, res) {
 app.get(`/current_song/${process.env.TWITCH_CHANNEL}`, function (req, res) {
   getCurrentSongJson(res);
 });
+
+// Configuration for the Twitch API
+const opts = {
+  identity: {
+    username: process.env.TWITCH_BOT_USERNAME,
+    password: process.env.TWITCH_BOT_PASSWORD,
+  },
+  channels: [`${process.env.TWITCH_CHANNEL}`],
+};
+
+// Create a client and pass our configuration
+const client = new tmi.client(opts);
+
+// Event handlers
+client.on('message', onMessageHandler);
+client.on('connected', onConnectedHandler);
+
+// Connect to the Twitch channel
+client.connect();
+
+// Function that gets called on every inbound chat message
+function onMessageHandler(target, context, msg, self) {
+  let displayName = context['display-name'];
+
+  // Trim the message
+  let commandName = msg.trim();
+
+  // Check if the message is the !song command, we are authorized and the command is not on cooldown
+  if (commandName === '!song' && didPoiAuthUs && canSendMessage) {
+    getCurrentSong(target, displayName);
+  }
+}
+
+// Called every time the bot connects to Twitch chat
+function onConnectedHandler(addr, port) {
+  console.log(`* Song command bot connected to twitch chat ${addr}:${port}`);
+}
